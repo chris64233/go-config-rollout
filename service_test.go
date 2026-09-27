@@ -423,18 +423,23 @@ func TestPauseResumeCancelTransitions(t *testing.T) {
 	}
 }
 
-// assertLegalLifecycle 校验事件流重放出的状态迁移全部合法且终态唯一。
+// assertLegalLifecycle 校验事件流按发布重放出的状态迁移全部合法且终态唯一。
 func assertLegalLifecycle(t *testing.T, evs []Event) {
 	t.Helper()
-	state := StateActive
+	states := map[string]ReleaseState{}
 	var prev int64
 	for _, ev := range evs {
 		if ev.Seq <= prev {
 			t.Fatalf("event seq not monotonic: %d after %d", ev.Seq, prev)
 		}
 		prev = ev.Seq
+		state, ok := states[ev.ReleaseID]
+		if !ok {
+			state = StateActive // 发布创建即 Active
+		}
 		switch ev.Type {
-		case EventWaveOpened, EventReleaseCreated, EventNodeSucceeded, EventNodeFailed, EventNodeCompensation:
+		case EventWaveOpened, EventReleaseCreated, EventNodeSucceeded, EventNodeFailed,
+			EventNodeCompensation, EventWaveObserving, EventNodeRollback, EventNodeRolledBack:
 			// 不改变发布主状态。
 		case EventReleasePaused:
 			if state != StateActive {
@@ -446,8 +451,18 @@ func assertLegalLifecycle(t *testing.T, evs []Event) {
 				t.Fatalf("illegal resume from %s", state)
 			}
 			state = StateActive
+		case EventRollbackStarted:
+			if state != StateActive {
+				t.Fatalf("illegal rollback start from %s", state)
+			}
+			state = StateRollingBack
+		case EventReleaseRolledBack:
+			if state != StateRollingBack {
+				t.Fatalf("illegal rolled-back from %s", state)
+			}
+			state = StateRolledBack
 		case EventReleaseCancelled:
-			if state != StateActive && state != StatePaused {
+			if state != StateActive && state != StatePaused && state != StateRollingBack {
 				t.Fatalf("illegal cancel from %s", state)
 			}
 			state = StateCancelled
@@ -457,6 +472,7 @@ func assertLegalLifecycle(t *testing.T, evs []Event) {
 			}
 			state = StateCompleted
 		}
+		states[ev.ReleaseID] = state
 	}
 }
 

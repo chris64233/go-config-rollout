@@ -53,4 +53,13 @@ var (
 	ErrNodeNeverApplied = errors.New("node has never applied a config")
 	// ErrEventNotFound：outbox 事件序号不存在。
 	ErrEventNotFound = errors.New("outbox event not found")
+
+	// ErrInvalidSample：健康样本缺少事件号等必要字段。
+	ErrInvalidSample = errors.New("invalid health sample")
+	// ErrSampleConflict：相同事件号的样本以不同内容再次到达。
+	ErrSampleConflict = errors.New("health sample event id reused with different content")
+	// ErrRollbackInProgress：发布正在自动回滚，不能暂停/恢复。
+	ErrRollbackInProgress = errors.New("release is rolling back")
+	// ErrNoRollback：发布当前没有进行中的回滚，回滚回执无效。
+	ErrNoRollback = errors.New("release is not rolling back")
 )

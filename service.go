@@ -90,6 +90,18 @@ func (s *Service) CreateRelease(in CreateReleaseInput) (*Release, error) {
 	if in.Policy.WaveTimeout <= 0 {
 		return nil, ErrInvalidPolicy
 	}
+	// 健康策略随发布一并冻结：要么完整关闭（全零值），要么完整合法。
+	hp := in.Policy.Health
+	if hp.ObserveWindow < 0 {
+		return nil, ErrInvalidPolicy
+	}
+	if hp.ObserveWindow == 0 {
+		if hp.MinSamples != 0 || hp.FailureThreshold != 0 {
+			return nil, ErrInvalidPolicy
+		}
+	} else if hp.MinSamples < 1 || hp.FailureThreshold <= 0 || hp.FailureThreshold > 1 {
+		return nil, ErrInvalidPolicy
+	}
 
 	// 冻结：复制一份并校验全局唯一（保持调用方给定的顺序）。
 	targets := append([]string(nil), in.Targets...)
@@ -121,6 +133,7 @@ func (s *Service) CreateRelease(in CreateReleaseInput) (*Release, error) {
 			State:     StateActive,
 			CreatedAt: now,
 			Nodes:     make(map[string]*NodeLease, len(targets)),
+			Samples:   make(map[string]*HealthSample),
 		}
 
 		// 有序切波；每个节点恰好落入一个波次。
@@ -207,8 +220,9 @@ func (s *Service) AckReceipt(rcpt Receipt) (*ReceiptOutcome, error) {
 			return ErrDigestMismatch
 		}
 
-		// 暂停可能由超时触发：先做超时判定，使状态序列保持单调。
-		s.evaluateTimeoutLocked(st, r)
+		// 暂停可能由超时触发、回滚可能由健康阈值触发：先做惰性评估，
+		// 使状态序列保持单调。
+		s.evaluateLocked(st, r)
 
 		// 幂等：节点已有终态结果（包括旧波次节点的重复回执）直接忽略。
 		if lease.Result == ResultSucceeded || lease.Result == ResultFailed {
@@ -221,9 +235,12 @@ func (s *Service) AckReceipt(rcpt Receipt) (*ReceiptOutcome, error) {
 			return ErrStaleReceipt
 		}
 		switch r.State {
-		case StateCancelled, StateCompleted:
+		case StateCancelled, StateCompleted, StateRolledBack:
 			return ErrTerminal
 		case StatePaused:
+			return ErrNotActive
+		case StateRollingBack:
+			// 回滚期间不再接受应用回执：迟到的成功回执不得覆盖回滚结果。
 			return ErrNotActive
 		}
 		// 只有当前开放波次中、尚未终态的节点可以确认结果。
@@ -259,6 +276,8 @@ func (s *Service) AckReceipt(rcpt Receipt) (*ReceiptOutcome, error) {
 			st.NodeStates[rcpt.NodeID] = ns
 		}
 		if r.Seq >= ns.AppliedReleaseSeq {
+			// 冻结回滚目标：节点在本次发布成功前的已应用摘要。
+			lease.PreDigest = ns.AppliedDigest
 			st.AppliedSeq++
 			ns.AppliedSeq = st.AppliedSeq
 			ns.AppliedReleaseSeq = r.Seq
@@ -269,21 +288,21 @@ func (s *Service) AckReceipt(rcpt Receipt) (*ReceiptOutcome, error) {
 
 		counts := waveCounts(r, r.CurrentWave)
 		if counts.Succeeded >= r.RequiredSuccess[r.CurrentWave] {
-			// 达标：原子开放下一波，或完成整个发布。
-			if r.CurrentWave == len(r.Waves)-1 {
-				r.State = StateCompleted
-				done := st.emit(EventReleaseCompleted, now)
-				done.ReleaseID = r.ID
-			} else {
-				r.CurrentWave++
-				r.WaveOpenedAt = now
-				for _, n := range r.Waves[r.CurrentWave] {
-					r.Nodes[n].Result = ResultInProgress
+			switch {
+			case r.Policy.Health.ObserveWindow > 0:
+				// 启用健康观测：波次进入观察状态，只有完整通过观察窗口
+				// 才允许开放下一波（由 evaluateHealthLocked 推进）。
+				// 已在观察中的波次不重置窗口、不重复发事件。
+				if r.ObservingSince.IsZero() {
+					r.ObservingSince = now
+					obs := st.emit(EventWaveObserving, now)
+					obs.ReleaseID, obs.Wave = r.ID, r.CurrentWave
 				}
-				open := st.emit(EventWaveOpened, now)
-				open.ReleaseID, open.Wave = r.ID, r.CurrentWave
+			default:
+				// 未启用观测：达标即原子推进/完成。
+				advanceWaveLocked(st, r, now)
+				out.WaveAdvanced = true
 			}
-			out.WaveAdvanced = true
 		}
 		out.State = r.State
 		out.CurrentWave = r.CurrentWave
@@ -310,6 +329,8 @@ func (s *Service) Pause(releaseID string) error {
 			return nil
 		case StatePaused:
 			return ErrAlreadyPaused
+		case StateRollingBack:
+			return ErrRollbackInProgress
 		default:
 			return ErrTerminal
 		}
@@ -324,10 +345,14 @@ func (s *Service) Resume(releaseID string) error {
 			return ErrReleaseNotFound
 		}
 		if r.State != StatePaused {
-			if r.State == StateActive {
+			switch r.State {
+			case StateActive:
 				return ErrNotPaused
+			case StateRollingBack:
+				return ErrRollbackInProgress
+			default:
+				return ErrTerminal
 			}
-			return ErrTerminal
 		}
 		now := s.clock.Now()
 		r.State = StateActive
@@ -343,6 +368,8 @@ func (s *Service) Resume(releaseID string) error {
 // Cancel 取消发布。Active/Paused -> Cancelled 是唯一会生成补偿通知的迁移：
 // 对取消时刻已经成功的每个节点恰好生成一条 node.compensation 事件；
 // 尚未开始的节点之后无法再取得配置。终态发布返回 ErrTerminal。
+// RollingBack -> Cancelled 也是合法迁移，但不再生成补偿通知：
+// 回滚通知（node.rollback）已覆盖全部成功节点，且每类通知只写出一次。
 func (s *Service) Cancel(releaseID string) error {
 	return s.store.mutate(func(st *State) error {
 		r, ok := st.Releases[releaseID]
@@ -350,17 +377,23 @@ func (s *Service) Cancel(releaseID string) error {
 			return ErrReleaseNotFound
 		}
 		switch r.State {
-		case StateCancelled, StateCompleted:
+		case StateCancelled, StateCompleted, StateRolledBack:
 			return ErrTerminal
 		}
 		now := s.clock.Now()
+		rollingBack := r.State == StateRollingBack
 		r.State = StateCancelled
 		r.PauseReason = ""
+		r.ObservingSince = time.Time{}
 		r.Version++
 
 		cancel := st.emit(EventReleaseCancelled, now)
 		cancel.ReleaseID = r.ID
 
+		if rollingBack {
+			// 回滚计划已覆盖所有成功节点，补偿通知不再重复生成。
+			return nil
+		}
 		// 只对当前已成功的节点补偿；节点在本次发布中只出现一次，
 		// 且本迁移只发生一次，所以补偿通知每个成功节点恰好一条。
 		for w, wave := range r.Waves {
@@ -385,8 +418,14 @@ func pauseLocked(st *State, r *Release, reason PauseReason, at time.Time) {
 	ev.Reason = string(reason)
 }
 
+// evaluateLocked 在每个会观察/推进发布的事务开始时调用：先做超时判定，
+// 再做健康观测评估（可能推进波次或触发自动回滚），保证状态序列单调。
+func (s *Service) evaluateLocked(st *State, r *Release) {
+	s.evaluateTimeoutLocked(st, r)
+	s.evaluateHealthLocked(st, r)
+}
+
 // evaluateTimeoutLocked 检查当前波次是否超时；超时则暂停。
-// 在每个会观察/推进发布的事务开始时调用。
 func (s *Service) evaluateTimeoutLocked(st *State, r *Release) {
 	if r.State != StateActive {
 		return
@@ -396,12 +435,126 @@ func (s *Service) evaluateTimeoutLocked(st *State, r *Release) {
 	}
 	counts := waveCounts(r, r.CurrentWave)
 	if counts.Succeeded >= r.RequiredSuccess[r.CurrentWave] {
-		return // 已达标，等待下一条成功回执推进即可，不算超时
+		return // 已达标（含观察窗口内），等待推进即可，不算超时
 	}
 	pauseLocked(st, r, PauseTimeout, s.clock.Now())
 }
 
-// TickTimeout 主动驱动超时检查（后台定时器可周期性调用），返回是否发生了暂停。
+// evaluateHealthLocked 评估当前波次的健康观察窗口：
+//   - 样本数达到 MinSamples 且不健康占比达到 FailureThreshold：触发一次自动回滚；
+//   - 观察窗口完整通过且未触发失败：原子开放下一波，或完成整个发布。
+//
+// 样本不足时不做失败判定（窗口走完即放行）。只在 Active 且处于观察状态时执行。
+func (s *Service) evaluateHealthLocked(st *State, r *Release) {
+	if r.State != StateActive || r.ObservingSince.IsZero() {
+		return
+	}
+	now := s.clock.Now()
+	h := healthEval(r, r.CurrentWave)
+	if h.Samples >= r.Policy.Health.MinSamples && h.UnhealthyRatio >= r.Policy.Health.FailureThreshold {
+		startRollbackLocked(st, r, now)
+		return
+	}
+	if now.Sub(r.ObservingSince) >= r.Policy.Health.ObserveWindow {
+		r.ObservingSince = time.Time{}
+		r.Version++
+		advanceWaveLocked(st, r, now)
+	}
+}
+
+// healthEvalResult 是当前波次健康证据的汇总（阈值计算的输入）。
+type healthEvalResult struct {
+	Samples        int
+	Unhealthy      int
+	UnhealthyRatio float64
+}
+
+// healthEval 汇总指定波次的健康样本：只统计本波次节点、且采样时间不早于
+// 本波开放时间的样本（乱序到达的样本按采样时间归位，跨波/跨发布的样本不参与）。
+func healthEval(r *Release, wave int) healthEvalResult {
+	inWave := make(map[string]bool, len(r.Waves[wave]))
+	for _, n := range r.Waves[wave] {
+		inWave[n] = true
+	}
+	var res healthEvalResult
+	for _, sm := range r.Samples {
+		if !inWave[sm.NodeID] || sm.SampledAt.Before(r.WaveOpenedAt) {
+			continue
+		}
+		res.Samples++
+		if !sm.Healthy {
+			res.Unhealthy++
+		}
+	}
+	if res.Samples > 0 {
+		res.UnhealthyRatio = float64(res.Unhealthy) / float64(res.Samples)
+	}
+	return res
+}
+
+// advanceWaveLocked 原子开放下一波，或在末波达标后完成整个发布。
+func advanceWaveLocked(st *State, r *Release, now time.Time) {
+	if r.CurrentWave == len(r.Waves)-1 {
+		r.State = StateCompleted
+		r.Version++
+		done := st.emit(EventReleaseCompleted, now)
+		done.ReleaseID = r.ID
+		return
+	}
+	r.CurrentWave++
+	r.WaveOpenedAt = now
+	for _, n := range r.Waves[r.CurrentWave] {
+		r.Nodes[n].Result = ResultInProgress
+	}
+	open := st.emit(EventWaveOpened, now)
+	open.ReleaseID, open.Wave = r.ID, r.CurrentWave
+}
+
+// startRollbackLocked 执行 Active -> RollingBack：一次性生成回滚计划，
+// 对每个已成功节点恰好生成一条 node.rollback 通知（携带其发布前配置摘要）。
+// 该迁移只发生一次，因此回滚计划与回滚通知都不会重复。
+func startRollbackLocked(st *State, r *Release, now time.Time) {
+	r.State = StateRollingBack
+	r.ObservingSince = time.Time{}
+	r.Version++
+
+	plan := &RollbackPlan{ReleaseID: r.ID, StartedAt: now}
+	started := st.emit(EventRollbackStarted, now)
+	started.ReleaseID = r.ID
+
+	for w, wave := range r.Waves {
+		for _, n := range wave {
+			if r.Nodes[n].Result != ResultSucceeded {
+				continue
+			}
+			item := &RollbackItem{
+				NodeID: n, Wave: w,
+				FromDigest: r.Digest, ToDigest: r.Nodes[n].PreDigest,
+				State: RollbackNotified,
+			}
+			plan.Items = append(plan.Items, item)
+			ev := st.emit(EventNodeRollback, now)
+			ev.ReleaseID, ev.Wave, ev.NodeID, ev.Digest = r.ID, w, n, item.ToDigest
+		}
+	}
+	r.Rollback = plan
+	if len(plan.Items) == 0 {
+		// 没有已应用节点：回滚立即完成。
+		completeRollbackLocked(st, r, now)
+	}
+}
+
+// completeRollbackLocked 执行 RollingBack -> RolledBack 终态迁移，
+// 发布终态通知（release.rolled_back）只在此处写出一次。
+func completeRollbackLocked(st *State, r *Release, now time.Time) {
+	r.State = StateRolledBack
+	r.Version++
+	done := st.emit(EventReleaseRolledBack, now)
+	done.ReleaseID = r.ID
+}
+
+// TickTimeout 主动驱动超时与健康观测评估（后台定时器可周期性调用），
+// 返回是否发生了暂停。
 func (s *Service) TickTimeout(releaseID string) (paused bool, err error) {
 	err = s.store.mutate(func(st *State) error {
 		r, ok := st.Releases[releaseID]
@@ -409,11 +562,115 @@ func (s *Service) TickTimeout(releaseID string) (paused bool, err error) {
 			return ErrReleaseNotFound
 		}
 		before := r.State
-		s.evaluateTimeoutLocked(st, r)
+		s.evaluateLocked(st, r)
 		paused = before == StateActive && r.State == StatePaused
 		return nil
 	})
 	return paused, err
+}
+
+// ---------- 健康样本与回滚 ----------
+
+// RecordSample 记录一条节点健康样本，并在样本落定后评估当前波次的健康阈值。
+//
+// 样本以 EventID 为幂等键：相同事件号、相同内容的重放幂等成功；同号异内容
+// 返回 ErrSampleConflict。样本必须归属该发布（节点在发布内）且摘要与发布
+// 配置一致（ErrDigestMismatch），因此不能跨发布或跨配置使用；乱序到达的样本
+// 按采样时间参与评估。发布已终态或正在回滚时样本被拒绝。
+func (s *Service) RecordSample(releaseID string, sm HealthSample) error {
+	if sm.EventID == "" {
+		return ErrInvalidSample
+	}
+	return s.store.mutate(func(st *State) error {
+		r, ok := st.Releases[releaseID]
+		if !ok {
+			return ErrReleaseNotFound
+		}
+		if _, ok := r.Nodes[sm.NodeID]; !ok {
+			return ErrNodeNotInRelease
+		}
+		if sm.Digest != r.Digest {
+			return ErrDigestMismatch
+		}
+		if existing, ok := r.Samples[sm.EventID]; ok {
+			if existing.NodeID == sm.NodeID && existing.Digest == sm.Digest &&
+				existing.Healthy == sm.Healthy && existing.SampledAt.Equal(sm.SampledAt) {
+				return nil // 相同事件重放：幂等
+			}
+			return ErrSampleConflict
+		}
+		switch r.State {
+		case StateCancelled, StateCompleted, StateRolledBack:
+			return ErrTerminal
+		case StateRollingBack:
+			return ErrNotActive
+		}
+		cp := sm
+		r.Samples[sm.EventID] = &cp
+		s.evaluateHealthLocked(st, r)
+		return nil
+	})
+}
+
+// AckRollback 处理节点的回滚确认：节点已恢复到回滚计划指定的发布前配置摘要。
+// restoredDigest 必须与计划中的目标摘要一致（ErrDigestMismatch）；重复确认幂等。
+// 全部计划项确认后，发布进入 RolledBack 终态（终态通知只写出一次）。
+func (s *Service) AckRollback(releaseID, nodeID, restoredDigest string) error {
+	return s.store.mutate(func(st *State) error {
+		r, ok := st.Releases[releaseID]
+		if !ok {
+			return ErrReleaseNotFound
+		}
+		switch r.State {
+		case StateCancelled, StateCompleted, StateRolledBack:
+			return ErrTerminal
+		case StateRollingBack:
+		default:
+			return ErrNoRollback
+		}
+		var item *RollbackItem
+		for _, it := range r.Rollback.Items {
+			if it.NodeID == nodeID {
+				item = it
+				break
+			}
+		}
+		if item == nil {
+			return ErrNodeNotInRelease
+		}
+		if item.State == RollbackDone {
+			return nil // 重复确认：幂等
+		}
+		if restoredDigest != item.ToDigest {
+			return ErrDigestMismatch
+		}
+
+		now := s.clock.Now()
+		item.State = RollbackDone
+		item.DoneAt = now
+		r.Version++
+		ev := st.emit(EventNodeRolledBack, now)
+		ev.ReleaseID, ev.Wave, ev.NodeID, ev.Digest = r.ID, item.Wave, nodeID, item.ToDigest
+
+		// 恢复节点“当前已应用版本”到发布前摘要；若节点已被更新的发布接管，
+		// 则保持单调、不覆盖较新版本（计划项仍记为完成）。
+		if ns := st.NodeStates[nodeID]; ns != nil && ns.AppliedReleaseSeq <= r.Seq {
+			st.AppliedSeq++
+			ns.AppliedSeq = st.AppliedSeq
+			ns.AppliedReleaseSeq = r.Seq
+			ns.AppliedReleaseID = r.ID
+			ns.AppliedDigest = item.ToDigest
+			ns.AppliedAt = now
+		}
+
+		for _, it := range r.Rollback.Items {
+			if it.State != RollbackDone {
+				return nil
+			}
+		}
+		completeRollbackLocked(st, r, now)
+		return nil
+	})
 }
 
 // ---------- 配置下发门禁 ----------
@@ -463,6 +720,42 @@ type WaveStatus struct {
 	Open       bool `json:"open"`
 }
 
+// HealthStatus 是当前波次的健康证据与阈值计算快照。
+type HealthStatus struct {
+	Enabled        bool      `json:"enabled"`
+	Observing      bool      `json:"observing"`
+	ObservingSince time.Time `json:"observing_since,omitempty"`
+	WindowEndsAt   time.Time `json:"window_ends_at,omitempty"`
+	// 冻结的阈值参数。
+	MinSamples int     `json:"min_samples"`
+	Threshold  float64 `json:"failure_threshold"`
+	// 阈值计算的输入：窗口内样本数、不健康数与占比。
+	Samples        int     `json:"samples"`
+	Unhealthy      int     `json:"unhealthy"`
+	UnhealthyRatio float64 `json:"unhealthy_ratio"`
+	// Verdict：insufficient_samples（样本不足，不做失败判定）/
+	// passing（未达失败阈值）/ failed（达到失败阈值，触发回滚）。
+	Verdict string `json:"verdict"`
+}
+
+// RollbackItemStatus 是回滚计划中单节点的前后版本与进度。
+type RollbackItemStatus struct {
+	NodeID     string            `json:"node_id"`
+	Wave       int               `json:"wave"`
+	FromDigest string            `json:"from_digest"`
+	ToDigest   string            `json:"to_digest"`
+	State      RollbackItemState `json:"state"`
+}
+
+// RollbackStatus 是回滚计划的进度快照。
+type RollbackStatus struct {
+	StartedAt time.Time            `json:"started_at"`
+	Total     int                  `json:"total"`
+	Done      int                  `json:"done"`
+	Complete  bool                 `json:"complete"`
+	Items     []RollbackItemStatus `json:"items"`
+}
+
 // Progress 是发布进度快照。
 type Progress struct {
 	ReleaseID      string       `json:"release_id"`
@@ -475,9 +768,14 @@ type Progress struct {
 	TotalSucceeded int          `json:"total_succeeded"`
 	TotalFailed    int          `json:"total_failed"`
 	WaveOpenedAt   time.Time    `json:"wave_opened_at"`
+	// Health 在启用健康观测时非空，展示健康证据与阈值计算。
+	Health *HealthStatus `json:"health,omitempty"`
+	// Rollback 在回滚计划生成后非空，展示每节点前后版本与回滚进度。
+	Rollback *RollbackStatus `json:"rollback,omitempty"`
 }
 
-// GetProgress 返回发布进度；查询时会顺带完成超时暂停判定，使超时状态及时落盘。
+// GetProgress 返回发布进度；查询时会顺带完成超时暂停与健康观测评估，
+// 使超时/回滚状态及时落盘。
 func (s *Service) GetProgress(releaseID string) (*Progress, error) {
 	var out *Progress
 	err := s.store.mutate(func(st *State) error {
@@ -485,7 +783,7 @@ func (s *Service) GetProgress(releaseID string) (*Progress, error) {
 		if !ok {
 			return ErrReleaseNotFound
 		}
-		s.evaluateTimeoutLocked(st, r)
+		s.evaluateLocked(st, r)
 		out = progressOf(r)
 		return nil
 	})
@@ -516,6 +814,46 @@ func progressOf(r *Release) *Progress {
 		p.TotalNodes += p.Waves[i].Total
 		p.TotalSucceeded += c.Succeeded
 		p.TotalFailed += c.Failed
+	}
+	if r.Policy.Health.ObserveWindow > 0 {
+		h := healthEval(r, r.CurrentWave)
+		hs := &HealthStatus{
+			Enabled:        true,
+			Observing:      !r.ObservingSince.IsZero(),
+			ObservingSince: r.ObservingSince,
+			MinSamples:     r.Policy.Health.MinSamples,
+			Threshold:      r.Policy.Health.FailureThreshold,
+			Samples:        h.Samples,
+			Unhealthy:      h.Unhealthy,
+			UnhealthyRatio: h.UnhealthyRatio,
+		}
+		if hs.Observing {
+			hs.WindowEndsAt = r.ObservingSince.Add(r.Policy.Health.ObserveWindow)
+		}
+		switch {
+		case h.Samples < r.Policy.Health.MinSamples:
+			hs.Verdict = "insufficient_samples"
+		case h.UnhealthyRatio >= r.Policy.Health.FailureThreshold:
+			hs.Verdict = "failed"
+		default:
+			hs.Verdict = "passing"
+		}
+		p.Health = hs
+	}
+	if r.Rollback != nil {
+		rs := &RollbackStatus{StartedAt: r.Rollback.StartedAt, Total: len(r.Rollback.Items)}
+		for _, it := range r.Rollback.Items {
+			if it.State == RollbackDone {
+				rs.Done++
+			}
+			rs.Items = append(rs.Items, RollbackItemStatus{
+				NodeID: it.NodeID, Wave: it.Wave,
+				FromDigest: it.FromDigest, ToDigest: it.ToDigest,
+				State: it.State,
+			})
+		}
+		rs.Complete = rs.Done == rs.Total
+		p.Rollback = rs
 	}
 	return p
 }
@@ -642,5 +980,19 @@ func cloneRelease(r *Release) *Release {
 		cp.Nodes[n] = &lc
 	}
 	cp.RequiredSuccess = append([]int(nil), r.RequiredSuccess...)
+	cp.Samples = make(map[string]*HealthSample, len(r.Samples))
+	for id, sm := range r.Samples {
+		smc := *sm
+		cp.Samples[id] = &smc
+	}
+	if r.Rollback != nil {
+		rb := *r.Rollback
+		rb.Items = make([]*RollbackItem, len(r.Rollback.Items))
+		for i, it := range r.Rollback.Items {
+			itc := *it
+			rb.Items[i] = &itc
+		}
+		cp.Rollback = &rb
+	}
 	return &cp
 }
