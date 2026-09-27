@@ -434,8 +434,14 @@ func assertLegalLifecycle(t *testing.T, evs []Event) {
 		}
 		prev = ev.Seq
 		switch ev.Type {
-		case EventWaveOpened, EventReleaseCreated, EventNodeSucceeded, EventNodeFailed, EventNodeCompensation:
+		case EventWaveOpened, EventReleaseCreated, EventNodeSucceeded, EventNodeFailed,
+			EventNodeCompensation, EventNodeRollback, EventNodeRestored:
 			// 不改变发布主状态。
+			if state == StateCancelled || state == StateCompleted || state == StateRolledBack {
+				if ev.Type == EventWaveOpened {
+					t.Fatalf("wave opened after terminal state %s", state)
+				}
+			}
 		case EventReleasePaused:
 			if state != StateActive {
 				t.Fatalf("illegal pause from %s", state)
@@ -451,6 +457,16 @@ func assertLegalLifecycle(t *testing.T, evs []Event) {
 				t.Fatalf("illegal cancel from %s", state)
 			}
 			state = StateCancelled
+		case EventRollbackStarted:
+			if state != StateActive {
+				t.Fatalf("illegal rollback start from %s", state)
+			}
+			state = StateRollingBack
+		case EventReleaseRolledBack:
+			if state != StateRollingBack {
+				t.Fatalf("illegal rolled-back from %s", state)
+			}
+			state = StateRolledBack
 		case EventReleaseCompleted:
 			if state != StateActive {
 				t.Fatalf("illegal complete from %s", state)

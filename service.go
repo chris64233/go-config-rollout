@@ -65,6 +65,8 @@ type CreateReleaseInput struct {
 	Targets  []string
 	WaveSize int
 	Policy   WavePolicy
+	// Health 是健康观察策略，与发布一并冻结；零值表示不启用健康观察。
+	Health HealthPolicy
 }
 
 // CreateRelease 冻结目标集合、切成有序波次并原子开放第 0 波。
@@ -90,6 +92,13 @@ func (s *Service) CreateRelease(in CreateReleaseInput) (*Release, error) {
 	if in.Policy.WaveTimeout <= 0 {
 		return nil, ErrInvalidPolicy
 	}
+	// 健康策略：零值关闭；一旦启用（任一字段非零），三个字段都必须合法。
+	healthEnabled := in.Health != (HealthPolicy{})
+	if healthEnabled {
+		if in.Health.ObserveWindow <= 0 || in.Health.MinSamples < 1 || in.Health.MaxUnhealthy < 0 {
+			return nil, ErrInvalidPolicy
+		}
+	}
 
 	// 冻结：复制一份并校验全局唯一（保持调用方给定的顺序）。
 	targets := append([]string(nil), in.Targets...)
@@ -114,13 +123,18 @@ func (s *Service) CreateRelease(in CreateReleaseInput) (*Release, error) {
 		now := s.clock.Now()
 		st.NextReleaseSeq++
 		r := &Release{
-			ID:        in.ID,
-			Seq:       st.NextReleaseSeq,
-			Digest:    in.Digest,
-			Policy:    policy,
-			State:     StateActive,
-			CreatedAt: now,
-			Nodes:     make(map[string]*NodeLease, len(targets)),
+			ID:            in.ID,
+			Seq:           st.NextReleaseSeq,
+			Digest:        in.Digest,
+			Policy:        policy,
+			Health:        in.Health,
+			HealthEnabled: healthEnabled,
+			State:         StateActive,
+			CreatedAt:     now,
+			Nodes:         make(map[string]*NodeLease, len(targets)),
+		}
+		if healthEnabled {
+			r.Samples = make(map[string]*HealthSampleRecord)
 		}
 
 		// 有序切波；每个节点恰好落入一个波次。
@@ -207,10 +221,12 @@ func (s *Service) AckReceipt(rcpt Receipt) (*ReceiptOutcome, error) {
 			return ErrDigestMismatch
 		}
 
-		// 暂停可能由超时触发：先做超时判定，使状态序列保持单调。
-		s.evaluateTimeoutLocked(st, r)
+		// 暂停/回滚可能由超时或健康评估触发：先做惰性评估，使状态序列保持单调。
+		s.evaluateLocked(st, r)
 
 		// 幂等：节点已有终态结果（包括旧波次节点的重复回执）直接忽略。
+		// 忽略路径不触碰节点已应用版本，因此回滚完成后迟到的成功回执
+		// 也不会覆盖回滚结果。
 		if lease.Result == ResultSucceeded || lease.Result == ResultFailed {
 			out = ReceiptOutcome{Ignored: true, State: r.State, CurrentWave: r.CurrentWave}
 			return nil
@@ -221,8 +237,10 @@ func (s *Service) AckReceipt(rcpt Receipt) (*ReceiptOutcome, error) {
 			return ErrStaleReceipt
 		}
 		switch r.State {
-		case StateCancelled, StateCompleted:
+		case StateCancelled, StateCompleted, StateRolledBack:
 			return ErrTerminal
+		case StateRollingBack:
+			return ErrRollbackInProgress
 		case StatePaused:
 			return ErrNotActive
 		}
@@ -254,6 +272,11 @@ func (s *Service) AckReceipt(rcpt Receipt) (*ReceiptOutcome, error) {
 		// 推进节点“当前已应用版本”：只允许单调向前，旧发布的成功回执
 		// 可以计入旧发布自身的审计，但不能覆盖节点较新的已应用版本。
 		ns := st.NodeStates[rcpt.NodeID]
+		// 在推进之前捕获发布前版本并冻结到 lease 上，供自动回滚恢复。
+		if ns != nil {
+			lease.PrevDigest = ns.AppliedDigest
+			lease.PrevReleaseID = ns.AppliedReleaseID
+		}
 		if ns == nil {
 			ns = &NodeState{NodeID: rcpt.NodeID}
 			st.NodeStates[rcpt.NodeID] = ns
@@ -269,21 +292,19 @@ func (s *Service) AckReceipt(rcpt Receipt) (*ReceiptOutcome, error) {
 
 		counts := waveCounts(r, r.CurrentWave)
 		if counts.Succeeded >= r.RequiredSuccess[r.CurrentWave] {
-			// 达标：原子开放下一波，或完成整个发布。
-			if r.CurrentWave == len(r.Waves)-1 {
-				r.State = StateCompleted
-				done := st.emit(EventReleaseCompleted, now)
-				done.ReleaseID = r.ID
-			} else {
-				r.CurrentWave++
-				r.WaveOpenedAt = now
-				for _, n := range r.Waves[r.CurrentWave] {
-					r.Nodes[n].Result = ResultInProgress
+			if r.HealthEnabled {
+				// 启用健康观察：达标只意味着进入观察期，需通过完整观察
+				// 窗口（且样本数、健康阈值均满足）才允许开启下一波。
+				if r.ThresholdMetAt.IsZero() {
+					r.ThresholdMetAt = now
 				}
-				open := st.emit(EventWaveOpened, now)
-				open.ReleaseID, open.Wave = r.ID, r.CurrentWave
+				waveBefore, stateBefore := r.CurrentWave, r.State
+				s.evaluateHealthLocked(st, r)
+				out.WaveAdvanced = r.CurrentWave != waveBefore || r.State != stateBefore
+			} else {
+				advanceWaveLocked(st, r, now)
+				out.WaveAdvanced = true
 			}
-			out.WaveAdvanced = true
 		}
 		out.State = r.State
 		out.CurrentWave = r.CurrentWave
@@ -293,6 +314,25 @@ func (s *Service) AckReceipt(rcpt Receipt) (*ReceiptOutcome, error) {
 		return nil, err
 	}
 	return &out, nil
+}
+
+// advanceWaveLocked 在当前波达标（且健康观察通过）后原子开放下一波，
+// 或在末波时完成整个发布。调用方必须持有存储事务。
+func advanceWaveLocked(st *State, r *Release, now time.Time) {
+	if r.CurrentWave == len(r.Waves)-1 {
+		r.State = StateCompleted
+		done := st.emit(EventReleaseCompleted, now)
+		done.ReleaseID = r.ID
+		return
+	}
+	r.CurrentWave++
+	r.WaveOpenedAt = now
+	r.ThresholdMetAt = time.Time{}
+	for _, n := range r.Waves[r.CurrentWave] {
+		r.Nodes[n].Result = ResultInProgress
+	}
+	open := st.emit(EventWaveOpened, now)
+	open.ReleaseID, open.Wave = r.ID, r.CurrentWave
 }
 
 // ---------- 暂停 / 恢复 / 取消 ----------
@@ -310,6 +350,8 @@ func (s *Service) Pause(releaseID string) error {
 			return nil
 		case StatePaused:
 			return ErrAlreadyPaused
+		case StateRollingBack:
+			return ErrRollbackInProgress
 		default:
 			return ErrTerminal
 		}
@@ -317,6 +359,8 @@ func (s *Service) Pause(releaseID string) error {
 }
 
 // Resume 恢复被暂停的发布，给予当前波次全新的超时窗口。仅 Paused -> Active 合法。
+// 恢复时顺带做一次健康评估：暂停期间窗口届满且样本达标的波次会立即推进，
+// 暂停期间累积的不健康证据则可能立即触发回滚。
 func (s *Service) Resume(releaseID string) error {
 	return s.store.mutate(func(st *State) error {
 		r, ok := st.Releases[releaseID]
@@ -324,10 +368,14 @@ func (s *Service) Resume(releaseID string) error {
 			return ErrReleaseNotFound
 		}
 		if r.State != StatePaused {
-			if r.State == StateActive {
+			switch r.State {
+			case StateActive:
 				return ErrNotPaused
+			case StateRollingBack:
+				return ErrRollbackInProgress
+			default:
+				return ErrTerminal
 			}
-			return ErrTerminal
 		}
 		now := s.clock.Now()
 		r.State = StateActive
@@ -336,13 +384,16 @@ func (s *Service) Resume(releaseID string) error {
 		r.Version++
 		ev := st.emit(EventReleaseResumed, now)
 		ev.ReleaseID = r.ID
+		s.evaluateHealthLocked(st, r)
 		return nil
 	})
 }
 
 // Cancel 取消发布。Active/Paused -> Cancelled 是唯一会生成补偿通知的迁移：
 // 对取消时刻已经成功的每个节点恰好生成一条 node.compensation 事件；
-// 尚未开始的节点之后无法再取得配置。终态发布返回 ErrTerminal。
+// 尚未开始的节点之后无法再取得配置。终态发布返回 ErrTerminal；
+// 正在自动回滚的发布返回 ErrRollbackInProgress（回滚与取消互斥，
+// 保证状态序列单调，不会一边回滚一边取消/开新波次）。
 func (s *Service) Cancel(releaseID string) error {
 	return s.store.mutate(func(st *State) error {
 		r, ok := st.Releases[releaseID]
@@ -350,8 +401,10 @@ func (s *Service) Cancel(releaseID string) error {
 			return ErrReleaseNotFound
 		}
 		switch r.State {
-		case StateCancelled, StateCompleted:
+		case StateCancelled, StateCompleted, StateRolledBack:
 			return ErrTerminal
+		case StateRollingBack:
+			return ErrRollbackInProgress
 		}
 		now := s.clock.Now()
 		r.State = StateCancelled
@@ -385,6 +438,13 @@ func pauseLocked(st *State, r *Release, reason PauseReason, at time.Time) {
 	ev.Reason = string(reason)
 }
 
+// evaluateLocked 做惰性状态评估：先超时暂停，再健康观察（推进或回滚）。
+// 在每个会观察/推进发布的事务开始时调用，保证状态序列单调。
+func (s *Service) evaluateLocked(st *State, r *Release) {
+	s.evaluateTimeoutLocked(st, r)
+	s.evaluateHealthLocked(st, r)
+}
+
 // evaluateTimeoutLocked 检查当前波次是否超时；超时则暂停。
 // 在每个会观察/推进发布的事务开始时调用。
 func (s *Service) evaluateTimeoutLocked(st *State, r *Release) {
@@ -396,12 +456,13 @@ func (s *Service) evaluateTimeoutLocked(st *State, r *Release) {
 	}
 	counts := waveCounts(r, r.CurrentWave)
 	if counts.Succeeded >= r.RequiredSuccess[r.CurrentWave] {
-		return // 已达标，等待下一条成功回执推进即可，不算超时
+		return // 已达标（含观察期内的波次），等待推进即可，不算超时
 	}
 	pauseLocked(st, r, PauseTimeout, s.clock.Now())
 }
 
-// TickTimeout 主动驱动超时检查（后台定时器可周期性调用），返回是否发生了暂停。
+// TickTimeout 主动驱动超时与健康评估（后台定时器可周期性调用），
+// 返回是否发生了暂停。
 func (s *Service) TickTimeout(releaseID string) (paused bool, err error) {
 	err = s.store.mutate(func(st *State) error {
 		r, ok := st.Releases[releaseID]
@@ -409,7 +470,7 @@ func (s *Service) TickTimeout(releaseID string) (paused bool, err error) {
 			return ErrReleaseNotFound
 		}
 		before := r.State
-		s.evaluateTimeoutLocked(st, r)
+		s.evaluateLocked(st, r)
 		paused = before == StateActive && r.State == StatePaused
 		return nil
 	})
@@ -477,7 +538,8 @@ type Progress struct {
 	WaveOpenedAt   time.Time    `json:"wave_opened_at"`
 }
 
-// GetProgress 返回发布进度；查询时会顺带完成超时暂停判定，使超时状态及时落盘。
+// GetProgress 返回发布进度；查询时会顺带完成超时暂停与健康评估，
+// 使超时/观察窗口状态及时落盘。
 func (s *Service) GetProgress(releaseID string) (*Progress, error) {
 	var out *Progress
 	err := s.store.mutate(func(st *State) error {
@@ -485,7 +547,7 @@ func (s *Service) GetProgress(releaseID string) (*Progress, error) {
 		if !ok {
 			return ErrReleaseNotFound
 		}
-		s.evaluateTimeoutLocked(st, r)
+		s.evaluateLocked(st, r)
 		out = progressOf(r)
 		return nil
 	})
@@ -642,5 +704,24 @@ func cloneRelease(r *Release) *Release {
 		cp.Nodes[n] = &lc
 	}
 	cp.RequiredSuccess = append([]int(nil), r.RequiredSuccess...)
+	if r.Samples != nil {
+		cp.Samples = make(map[string]*HealthSampleRecord, len(r.Samples))
+		for k, v := range r.Samples {
+			vc := *v
+			cp.Samples[k] = &vc
+		}
+	}
+	if r.Rollback != nil {
+		rb := &RollbackPlan{
+			Reason:    r.Rollback.Reason,
+			CreatedAt: r.Rollback.CreatedAt,
+			Entries:   make(map[string]*RollbackEntry, len(r.Rollback.Entries)),
+		}
+		for k, e := range r.Rollback.Entries {
+			ec := *e
+			rb.Entries[k] = &ec
+		}
+		cp.Rollback = rb
+	}
 	return &cp
 }
