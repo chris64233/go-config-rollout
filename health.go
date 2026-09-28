@@ -60,6 +60,8 @@ func (s *Service) ReportHealth(sample HealthSample) (*HealthOutcome, error) {
 			return ErrHealthNotEnabled
 		}
 		// 幂等键为事件号：同号同内容重放幂等，同号异内容冲突。
+		// 该检查先于隔离拦截：隔离依据样本的重放仍须幂等忽略，
+		// 不得因节点已隔离而改变语义（更不能改写既有决定）。
 		if prev, ok := r.Samples[sample.EventID]; ok {
 			if prev.NodeID == sample.NodeID && prev.Digest == sample.Digest &&
 				prev.Healthy == sample.Healthy && prev.SampledAt.Equal(sample.SampledAt) {
@@ -67,6 +69,11 @@ func (s *Service) ReportHealth(sample HealthSample) (*HealthOutcome, error) {
 				return nil
 			}
 			return ErrSampleConflict
+		}
+		// 已隔离节点不能继续接收本次发布的新操作：新事件号的样本一律拒绝，
+		// 迟到证据不会重新改写已经形成的隔离/回滚决定。
+		if _, q := r.Quarantined[sample.NodeID]; q {
+			return ErrNodeQuarantined
 		}
 		switch r.State {
 		case StateActive, StatePaused:
@@ -106,9 +113,11 @@ func (s *Service) ReportHealth(sample HealthSample) (*HealthOutcome, error) {
 // ---------- 健康评估与自动回滚 ----------
 
 // evaluateHealthLocked 对 Active 且启用健康观察的发布做评估：
-//  1. 当前波已成功节点中，含失败样本的节点数超过 MaxUnhealthy ->
+//  1. 当前波已成功且未隔离节点中，含失败样本的节点数超过 MaxUnhealthy ->
 //     生成一次性回滚计划（Active -> RollingBack），不再开新波次；
-//  2. 否则，观察窗口届满且每个已成功节点样本数达到 MinSamples ->
+//  2. 隔离不能掩盖大面积故障：累计隔离节点数超过冻结的 MaxQuarantined，
+//     或当前波健康覆盖率低于 MinHealthyCoverage -> 同样整体回滚；
+//  3. 否则，观察窗口届满且每个未隔离的已成功节点样本数达到 MinSamples ->
 //     原子开放下一波（末波则完成发布）。
 //
 // 回滚判定先于窗口推进判定，二者在同一事务内互斥，保证不会一边回滚
@@ -126,19 +135,43 @@ func (s *Service) evaluateHealthLocked(st *State, r *Release) {
 	}
 	now := s.clock.Now()
 
-	// 阈值计算：当前波已成功节点中，存在失败样本的节点数。
+	// 阈值计算：当前波已成功、且未被隔离的节点中，存在失败样本的节点数。
+	// 已隔离节点不再计入后续健康门槛（既不算不健康，也不要求样本达标）。
 	unhealthy := 0
+	waveSucceeded := 0
+	covered := 0 // 未隔离的已成功节点数（健康覆盖率分子）
 	for _, n := range r.Waves[r.CurrentWave] {
 		if r.Nodes[n].Result != ResultSucceeded {
 			continue
 		}
+		waveSucceeded++
+		if r.Quarantined != nil {
+			if _, q := r.Quarantined[n]; q {
+				continue
+			}
+		}
+		covered++
 		if _, bad := nodeSampleCounts(r, n); bad > 0 {
 			unhealthy++
 		}
 	}
 	if unhealthy > r.Health.MaxUnhealthy {
-		startRollbackLocked(st, r, now)
+		startRollbackLocked(st, r, RollbackReasonHealthThreshold, now)
 		return
+	}
+	// 隔离上限：累计隔离数与当前波健康覆盖率任一越界即整体回滚。
+	if r.QuarantineEnabled {
+		if len(r.Quarantined) > r.Quarantine.MaxQuarantined {
+			startRollbackLocked(st, r, RollbackReasonQuarantineLimit, now)
+			return
+		}
+		if waveSucceeded > 0 {
+			coverage := float64(covered) / float64(waveSucceeded)
+			if coverage < r.Quarantine.MinHealthyCoverage {
+				startRollbackLocked(st, r, RollbackReasonQuarantineLimit, now)
+				return
+			}
+		}
 	}
 
 	// 观察窗口未届满：继续观察。
@@ -146,9 +179,15 @@ func (s *Service) evaluateHealthLocked(st *State, r *Release) {
 		return
 	}
 	// 窗口届满但样本数不足：继续等待样本（不算超时，可人工暂停/取消）。
+	// 已隔离节点不再要求样本达标。
 	for _, n := range r.Waves[r.CurrentWave] {
 		if r.Nodes[n].Result != ResultSucceeded {
 			continue
+		}
+		if r.Quarantined != nil {
+			if _, q := r.Quarantined[n]; q {
+				continue
+			}
 		}
 		if total, _ := nodeSampleCounts(r, n); total < r.Health.MinSamples {
 			return
@@ -173,21 +212,22 @@ func nodeSampleCounts(r *Release, node string) (total, unhealthy int) {
 }
 
 // startRollbackLocked 生成一次性回滚计划：对当前已成功应用配置的每个节点
-// 恰好写出一条 node.rollback 通知（目标为各自发布前的配置摘要），发布进入
-// RollingBack。没有需要恢复的节点时直接落到终态 RolledBack。
-func startRollbackLocked(st *State, r *Release, now time.Time) {
+// （含已隔离节点——整体回滚意味着隔离也不能豁免）恰好写出一条
+// node.rollback 通知（目标为各自发布前的配置摘要），发布进入 RollingBack。
+// 没有需要恢复的节点时直接落到终态 RolledBack。
+func startRollbackLocked(st *State, r *Release, reason string, now time.Time) {
 	r.State = StateRollingBack
 	r.PauseReason = ""
 	r.Version++
 
 	plan := &RollbackPlan{
-		Reason:    RollbackReasonHealthThreshold,
+		Reason:    reason,
 		CreatedAt: now,
 		Entries:   make(map[string]*RollbackEntry),
 	}
 	started := st.emit(EventRollbackStarted, now)
 	started.ReleaseID = r.ID
-	started.Reason = RollbackReasonHealthThreshold
+	started.Reason = reason
 
 	for w, wave := range r.Waves {
 		for _, n := range wave {
@@ -207,6 +247,8 @@ func startRollbackLocked(st *State, r *Release, now time.Time) {
 		}
 	}
 	r.Rollback = plan
+	// 整体回滚后，隔离节点的旧补跑不得继续执行：随回滚一并作废。
+	abortCatchupLocked(st, r, CatchupAbortRolledBack, now)
 	if len(plan.Entries) == 0 {
 		completeRollbackLocked(st, r, now)
 	}
@@ -323,6 +365,10 @@ type NodeHealthView struct {
 	Samples          int `json:"samples"`
 	UnhealthySamples int `json:"unhealthy_samples"`
 
+	// Quarantined 标记节点已被隔离；Basis 为隔离依据的样本事件号。
+	Quarantined bool     `json:"quarantined"`
+	Basis       []string `json:"basis,omitempty"`
+
 	// PrevDigest 是发布前已应用的配置摘要（空串表示此前无版本）；
 	// CurrentDigest 是节点当前已应用版本（跨发布的最新值）。
 	PrevDigest    string `json:"prev_digest,omitempty"`
@@ -371,6 +417,11 @@ type HealthView struct {
 	SamplesRecorded int              `json:"samples_recorded"`
 	Nodes           []NodeHealthView `json:"nodes"`
 	Rollback        *RollbackView    `json:"rollback,omitempty"`
+
+	// Quarantine 展示冻结的隔离策略、隔离决定与覆盖率计算；未启用为 nil。
+	Quarantine *QuarantineView `json:"quarantine,omitempty"`
+	// Catchup 展示隔离节点的补跑进度；尚未创建计划为 nil。
+	Catchup *CatchupView `json:"catchup,omitempty"`
 }
 
 // GetHealth 返回发布的健康视图；查询时顺带完成惰性评估（超时/观察窗口），
@@ -383,7 +434,7 @@ func (s *Service) GetHealth(releaseID string) (*HealthView, error) {
 			return ErrReleaseNotFound
 		}
 		s.evaluateLocked(st, r)
-		out = healthViewOf(st, r)
+		out = healthViewOf(st, r, s.clock.Now())
 		return nil
 	})
 	if err != nil {
@@ -392,7 +443,7 @@ func (s *Service) GetHealth(releaseID string) (*HealthView, error) {
 	return out, nil
 }
 
-func healthViewOf(st *State, r *Release) *HealthView {
+func healthViewOf(st *State, r *Release, now time.Time) *HealthView {
 	v := &HealthView{
 		ReleaseID:       r.ID,
 		State:           r.State,
@@ -431,7 +482,15 @@ func healthViewOf(st *State, r *Release) *HealthView {
 			UnhealthySamples: bad,
 			PrevDigest:       lease.PrevDigest,
 		}
+		qrec, isQ := r.Quarantined[n]
+		if isQ {
+			nv.Quarantined = true
+			nv.Basis = append([]string(nil), qrec.Basis...)
+		}
 		switch {
+		case isQ:
+			// 已隔离：展示隔离依据，不再参与任何健康门槛。
+			nv.Health = HealthQuarantined
 		case lease.Result != ResultSucceeded:
 			nv.Health = HealthUnknown
 		case bad > 0:
@@ -444,12 +503,19 @@ func healthViewOf(st *State, r *Release) *HealthView {
 		if ns := st.NodeStates[n]; ns != nil {
 			nv.CurrentDigest = ns.AppliedDigest
 		}
-		if lease.Wave == r.CurrentWave && lease.Result == ResultSucceeded && nv.Health == HealthUnhealthy {
+		if !isQ && lease.Wave == r.CurrentWave && lease.Result == ResultSucceeded && nv.Health == HealthUnhealthy {
 			v.UnhealthyNodes++
 		}
 		v.Nodes = append(v.Nodes, nv)
 	}
 	v.ThresholdBreached = r.HealthEnabled && v.UnhealthyNodes > r.Health.MaxUnhealthy
+
+	if r.QuarantineEnabled {
+		v.Quarantine = quarantineViewOf(r)
+	}
+	if r.Catchup != nil {
+		v.Catchup = catchupViewOf(st, r, now)
+	}
 
 	if r.Rollback != nil {
 		restored, total := rollbackProgress(r.Rollback)

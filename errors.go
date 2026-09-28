@@ -65,4 +65,38 @@ var (
 	ErrRollbackInProgress = errors.New("release is rolling back")
 	// ErrNoRollback：发布没有回滚计划，无从确认恢复。
 	ErrNoRollback = errors.New("release has no rollback plan")
+
+	// ErrQuarantineNotEnabled：发布未启用隔离策略（随健康观察一并启用）。
+	ErrQuarantineNotEnabled = errors.New("release has no quarantine policy")
+	// ErrAlreadyQuarantined：节点在本次发布中已被隔离，隔离决定不可改写。
+	ErrAlreadyQuarantined = errors.New("node already quarantined in this release")
+	// ErrQuarantineBasisMissing：隔离请求未引用任何健康样本事件号。
+	ErrQuarantineBasisMissing = errors.New("quarantine requires at least one health sample as basis")
+	// ErrQuarantineBasisUnknown：引用的样本事件号不存在或不属于该节点。
+	ErrQuarantineBasisUnknown = errors.New("quarantine basis sample is unknown or belongs to another node")
+	// ErrQuarantineNodeNotSucceeded：只能隔离当前观察波中已成功应用的节点。
+	ErrQuarantineNodeNotSucceeded = errors.New("node has not succeeded in the current wave")
+	// ErrNodeQuarantined：节点已被隔离，不能继续接收本次发布的新操作
+	// （健康样本/配置拉取等）。
+	ErrNodeQuarantined = errors.New("node is quarantined in this release")
+
+	// ErrNoCatchup：发布没有补跑计划。
+	ErrNoCatchup = errors.New("release has no catch-up plan")
+	// ErrCatchupActive：已存在未结束的补跑计划，需先作废/完成才能重建。
+	ErrCatchupActive = errors.New("an active catch-up plan already exists")
+	// ErrCatchupNotActive：补跑计划已结束（完成/作废），不能再领取或回报。
+	ErrCatchupNotActive = errors.New("catch-up plan is no longer active")
+	// ErrCatchupEntryMissing：补跑计划中没有该节点（节点未被隔离或不在计划内）。
+	ErrCatchupEntryMissing = errors.New("node is not in the catch-up plan")
+	// ErrCatchupNotClaimed：节点补跑项未被领取，不能回报结果。
+	ErrCatchupNotClaimed = errors.New("catch-up entry is not claimed")
+	// ErrClaimLost：领取租约已过期或已被他人重新领取，旧领取者的回报无效。
+	ErrClaimLost = errors.New("catch-up claim lease lost or expired")
+	// ErrCatchupBlocked：前序波次尚有未成功项（失败/未完成），本波不可领取。
+	ErrCatchupBlocked = errors.New("earlier catch-up wave is not finished")
+	// ErrNoCatchupWork：当前没有可领取的补跑项（波次屏障或已领完）。
+	ErrNoCatchupWork = errors.New("no catch-up work available")
+	// ErrBaselineChanged：创建补跑计划后节点基线已变化（被其它发布推进），
+	// 旧补跑不得执行。
+	ErrBaselineChanged = errors.New("node baseline changed since catch-up plan creation")
 )

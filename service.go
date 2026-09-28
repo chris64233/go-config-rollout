@@ -67,6 +67,9 @@ type CreateReleaseInput struct {
 	Policy   WavePolicy
 	// Health 是健康观察策略，与发布一并冻结；零值表示不启用健康观察。
 	Health HealthPolicy
+	// Quarantine 是隔离策略，与健康观察一并冻结；零值表示不允许隔离。
+	// 仅当健康观察启用（Health 非零值）时才允许配置隔离策略。
+	Quarantine QuarantinePolicy
 }
 
 // CreateRelease 冻结目标集合、切成有序波次并原子开放第 0 波。
@@ -99,6 +102,17 @@ func (s *Service) CreateRelease(in CreateReleaseInput) (*Release, error) {
 			return nil, ErrInvalidPolicy
 		}
 	}
+	// 隔离策略：零值关闭；非零值时随健康观察一并启用。
+	quarantineEnabled := in.Quarantine != (QuarantinePolicy{})
+	if quarantineEnabled {
+		if !healthEnabled {
+			return nil, ErrInvalidPolicy
+		}
+		if in.Quarantine.MaxQuarantined < 0 ||
+			in.Quarantine.MinHealthyCoverage <= 0 || in.Quarantine.MinHealthyCoverage > 1 {
+			return nil, ErrInvalidPolicy
+		}
+	}
 
 	// 冻结：复制一份并校验全局唯一（保持调用方给定的顺序）。
 	targets := append([]string(nil), in.Targets...)
@@ -123,18 +137,23 @@ func (s *Service) CreateRelease(in CreateReleaseInput) (*Release, error) {
 		now := s.clock.Now()
 		st.NextReleaseSeq++
 		r := &Release{
-			ID:            in.ID,
-			Seq:           st.NextReleaseSeq,
-			Digest:        in.Digest,
-			Policy:        policy,
-			Health:        in.Health,
-			HealthEnabled: healthEnabled,
-			State:         StateActive,
-			CreatedAt:     now,
-			Nodes:         make(map[string]*NodeLease, len(targets)),
+			ID:                in.ID,
+			Seq:               st.NextReleaseSeq,
+			Digest:            in.Digest,
+			Policy:            policy,
+			Health:            in.Health,
+			HealthEnabled:     healthEnabled,
+			Quarantine:        in.Quarantine,
+			QuarantineEnabled: quarantineEnabled,
+			State:             StateActive,
+			CreatedAt:         now,
+			Nodes:             make(map[string]*NodeLease, len(targets)),
 		}
 		if healthEnabled {
 			r.Samples = make(map[string]*HealthSampleRecord)
+		}
+		if quarantineEnabled {
+			r.Quarantined = make(map[string]*QuarantineRecord)
 		}
 
 		// 有序切波；每个节点恰好落入一个波次。
@@ -288,6 +307,9 @@ func (s *Service) AckReceipt(rcpt Receipt) (*ReceiptOutcome, error) {
 			ns.AppliedReleaseID = r.ID
 			ns.AppliedDigest = r.Digest
 			ns.AppliedAt = now
+			// 节点被（新）发布推进：其它发布中针对该节点的活跃补跑基线
+			// 已失效，立即作废，旧补跑之后无法领取/回报。
+			abortSupersededCatchupLocked(st, r, rcpt.NodeID, now)
 		}
 
 		counts := waveCounts(r, r.CurrentWave)
@@ -414,6 +436,9 @@ func (s *Service) Cancel(releaseID string) error {
 		cancel := st.emit(EventReleaseCancelled, now)
 		cancel.ReleaseID = r.ID
 
+		// 取消后旧补跑同样不得继续执行。
+		abortCatchupLocked(st, r, CatchupAbortRolledBack, now)
+
 		// 只对当前已成功的节点补偿；节点在本次发布中只出现一次，
 		// 且本迁移只发生一次，所以补偿通知每个成功节点恰好一条。
 		for w, wave := range r.Waves {
@@ -496,6 +521,10 @@ func (s *Service) GetConfigForNode(releaseID, nodeID string) (*Config, error) {
 		if r.State != StateActive || lease.Wave != r.CurrentWave {
 			// 取消/完成后的任何未成功节点，以及未来波次、旧波次节点。
 			return ErrConfigNotAvailable
+		}
+		// 被隔离节点不能继续接收本次发布的新操作（包括再次拉取配置）。
+		if _, q := r.Quarantined[nodeID]; q {
+			return ErrNodeQuarantined
 		}
 		cfg := st.Configs[r.Digest]
 		if cfg == nil {
@@ -710,6 +739,18 @@ func cloneRelease(r *Release) *Release {
 			vc := *v
 			cp.Samples[k] = &vc
 		}
+	}
+	if r.Quarantined != nil {
+		cp.Quarantined = make(map[string]*QuarantineRecord, len(r.Quarantined))
+		for k, q := range r.Quarantined {
+			qc := *q
+			qc.Basis = append([]string(nil), q.Basis...)
+			cp.Quarantined[k] = &qc
+		}
+	}
+	cp.CatchupAttempt = r.CatchupAttempt
+	if r.Catchup != nil {
+		cp.Catchup = cloneCatchup(r.Catchup)
 	}
 	if r.Rollback != nil {
 		rb := &RollbackPlan{
