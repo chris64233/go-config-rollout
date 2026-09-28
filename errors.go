@@ -65,4 +65,27 @@ var (
 	ErrRollbackInProgress = errors.New("release is rolling back")
 	// ErrNoRollback：发布没有回滚计划，无从确认恢复。
 	ErrNoRollback = errors.New("release has no rollback plan")
+
+	// ErrQuarantineNotEnabled：发布未配置隔离闸门（MaxNodes=0），不允许隔离。
+	ErrQuarantineNotEnabled = errors.New("release has no quarantine policy")
+	// ErrNodeNotQuarantined：节点未被隔离，不能为其创建补跑计划。
+	ErrNodeNotQuarantined = errors.New("node is not quarantined")
+	// ErrQuarantineNoEvidence：隔离请求未携带任何健康样本依据。
+	ErrQuarantineNoEvidence = errors.New("quarantine requires at least one health sample")
+	// ErrQuarantineEvidenceMismatch：依据样本不属于该（发布, 节点, 摘要），
+	// 或引用了尚不存在的事件号。
+	ErrQuarantineEvidenceMismatch = errors.New("quarantine evidence does not belong to this node/release")
+
+	// ErrCatchupNotFound：补跑计划不存在。
+	ErrCatchupNotFound = errors.New("catchup plan not found")
+	// ErrCatchupNotClaimable：计划当前不可领取（已成功/已作废，或已被他人
+	// 持有且尚未失败）。
+	ErrCatchupNotClaimable = errors.New("catchup plan is not claimable")
+	// ErrCatchupFencing：上报携带的 fencing token 已过期（旧领取者的迟到
+	// 上报），不能覆盖后来的状态。
+	ErrCatchupFencing = errors.New("catchup claim token is stale")
+	// ErrCatchupAborted：补跑计划已作废，不能再执行/上报。
+	ErrCatchupAborted = errors.New("catchup plan has been aborted")
+	// ErrCatchupExists：该隔离节点已有（未作废的）补跑计划。
+	ErrCatchupExists = errors.New("catchup plan already exists for quarantined node")
 )

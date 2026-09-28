@@ -106,13 +106,17 @@ func (s *Service) ReportHealth(sample HealthSample) (*HealthOutcome, error) {
 // ---------- 健康评估与自动回滚 ----------
 
 // evaluateHealthLocked 对 Active 且启用健康观察的发布做评估：
-//  1. 当前波已成功节点中，含失败样本的节点数超过 MaxUnhealthy ->
+//  1. 当前波已成功且未隔离节点中，含失败样本的节点数超过 MaxUnhealthy ->
 //     生成一次性回滚计划（Active -> RollingBack），不再开新波次；
-//  2. 否则，观察窗口届满且每个已成功节点样本数达到 MinSamples ->
+//  2. 隔离闸门（启用隔离策略时）：已隔离节点数超过冻结的 MaxNodes，或
+//     已有健康结论的未隔离节点中健康覆盖率（健康 /（健康+不健康））低于
+//     MinHealthyCoverage -> 同样触发现有整体回滚，隔离不能掩盖大面积故障；
+//  3. 否则，观察窗口届满且每个未隔离已成功节点样本数达到 MinSamples ->
 //     原子开放下一波（末波则完成发布）。
 //
-// 回滚判定先于窗口推进判定，二者在同一事务内互斥，保证不会一边回滚
-// 一边开新波次。
+// 已隔离节点不计入不健康计数、覆盖率与样本充足性；隔离决定一旦形成即
+// 冻结，迟到/重复样本只追加证据，不会改判。回滚判定先于窗口推进判定，
+// 二者在同一事务内互斥，保证不会一边回滚一边开新波次。
 func (s *Service) evaluateHealthLocked(st *State, r *Release) {
 	if r.State != StateActive || !r.HealthEnabled {
 		return
@@ -126,14 +130,27 @@ func (s *Service) evaluateHealthLocked(st *State, r *Release) {
 	}
 	now := s.clock.Now()
 
-	// 阈值计算：当前波已成功节点中，存在失败样本的节点数。
+	// 阈值计算只统计当前波已成功、未隔离的节点；已隔离节点不再计入
+	// 任何后续健康门槛。
 	unhealthy := 0
+	healthy := 0
+	decided := 0 // 已有健康结论：样本达标，或含失败样本
 	for _, n := range r.Waves[r.CurrentWave] {
 		if r.Nodes[n].Result != ResultSucceeded {
 			continue
 		}
-		if _, bad := nodeSampleCounts(r, n); bad > 0 {
+		if isQuarantinedLocked(r, n) {
+			continue
+		}
+		total, bad := nodeSampleCounts(r, n)
+		if bad > 0 {
 			unhealthy++
+			decided++
+			continue
+		}
+		if total >= r.Health.MinSamples {
+			healthy++
+			decided++
 		}
 	}
 	if unhealthy > r.Health.MaxUnhealthy {
@@ -141,13 +158,31 @@ func (s *Service) evaluateHealthLocked(st *State, r *Release) {
 		return
 	}
 
+	// 隔离闸门：MaxNodes 与最低健康覆盖率。覆盖率以已有健康结论的节点为
+	// 分母（窗口届满时所有未隔离节点都已有结论，口径与全量一致）；尚无
+	// 任何结论时不据覆盖率回滚，MaxNodes 上限始终生效。
+	if qp := r.Health.Quarantine; qp != (QuarantinePolicy{}) && len(r.Quarantines) > 0 {
+		if len(r.Quarantines) > qp.MaxNodes {
+			startRollbackLocked(st, r, now)
+			return
+		}
+		if decided > 0 && float64(healthy)/float64(decided) < qp.MinHealthyCoverage {
+			startRollbackLocked(st, r, now)
+			return
+		}
+	}
+
 	// 观察窗口未届满：继续观察。
 	if now.Sub(r.ThresholdMetAt) < r.Health.ObserveWindow {
 		return
 	}
 	// 窗口届满但样本数不足：继续等待样本（不算超时，可人工暂停/取消）。
+	// 已隔离节点不要求补齐样本。
 	for _, n := range r.Waves[r.CurrentWave] {
 		if r.Nodes[n].Result != ResultSucceeded {
+			continue
+		}
+		if isQuarantinedLocked(r, n) {
 			continue
 		}
 		if total, _ := nodeSampleCounts(r, n); total < r.Health.MinSamples {
@@ -180,15 +215,18 @@ func startRollbackLocked(st *State, r *Release, now time.Time) {
 	r.PauseReason = ""
 	r.Version++
 
+	started := st.emit(EventRollbackStarted, now)
+	started.ReleaseID = r.ID
+	started.Reason = RollbackReasonHealthThreshold
+
+	// 整体回滚使所有未终态的补跑计划作废：旧补跑不得在回滚后继续执行。
+	abortActiveCatchupsLocked(st, r, CatchupAbortReleaseRolledBack, now)
+
 	plan := &RollbackPlan{
 		Reason:    RollbackReasonHealthThreshold,
 		CreatedAt: now,
 		Entries:   make(map[string]*RollbackEntry),
 	}
-	started := st.emit(EventRollbackStarted, now)
-	started.ReleaseID = r.ID
-	started.Reason = RollbackReasonHealthThreshold
-
 	for w, wave := range r.Waves {
 		for _, n := range wave {
 			lease := r.Nodes[n]
@@ -323,10 +361,57 @@ type NodeHealthView struct {
 	Samples          int `json:"samples"`
 	UnhealthySamples int `json:"unhealthy_samples"`
 
+	// Quarantined 标记节点是否已被隔离；隔离后其证据/波次/摘要被冻结，
+	// 不计入任何后续健康门槛。
+	Quarantined bool `json:"quarantined,omitempty"`
+	// Quarantine 是隔离决定的依据视图（仅 Quarantined 时非空）。
+	Quarantine *QuarantineView `json:"quarantine,omitempty"`
+
 	// PrevDigest 是发布前已应用的配置摘要（空串表示此前无版本）；
 	// CurrentDigest 是节点当前已应用版本（跨发布的最新值）。
 	PrevDigest    string `json:"prev_digest,omitempty"`
 	CurrentDigest string `json:"current_digest,omitempty"`
+}
+
+// QuarantineView 是一条隔离决定及其依据的视图。
+type QuarantineView struct {
+	Wave      int       `json:"wave"`
+	Digest    string    `json:"digest"`
+	Reason    string    `json:"reason,omitempty"`
+	At        time.Time `json:"at"`
+	Samples   int       `json:"samples"`
+	Unhealthy int       `json:"unhealthy_samples"`
+	// EvidenceEventIDs 是操作员隔离时所依据的健康样本事件号快照（冻结）。
+	EvidenceEventIDs []string `json:"evidence_event_ids"`
+}
+
+// CatchupPlanView 是一个隔离节点的补跑计划与进度视图。
+type CatchupPlanView struct {
+	PlanID    string       `json:"plan_id"`
+	NodeID    string       `json:"node_id"`
+	State     CatchupState `json:"state"`
+	CreatedAt time.Time    `json:"created_at"`
+
+	// 补跑从节点当前配置开始，按原发布波次顺序恢复到目标摘要。
+	FromDigest   string   `json:"from_digest"`
+	TargetDigest string   `json:"target_digest"`
+	OriginalWave int      `json:"original_wave"`
+	Path         []string `json:"path"`
+
+	Fencing   int64     `json:"fencing"`
+	ClaimedBy string    `json:"claimed_by,omitempty"`
+	ClaimedAt time.Time `json:"claimed_at,omitempty"`
+
+	SucceededAt time.Time `json:"succeeded_at,omitempty"`
+	// AbortReason 是计划无法继续的原因（整体回滚/取消/被新发布取代/基线漂移）。
+	AbortReason string    `json:"abort_reason,omitempty"`
+	AbortedAt   time.Time `json:"aborted_at,omitempty"`
+
+	// NodeCurrentDigest 是查询时刻节点的实际配置摘要；当它既非起点也非
+	// 目标时即发生基线漂移，补跑不可继续。
+	NodeCurrentDigest string `json:"node_current_digest,omitempty"`
+	// BlockedReason 是计划当前无法继续执行的人类可读原因（可执行时为空）。
+	BlockedReason string `json:"blocked_reason,omitempty"`
 }
 
 // RollbackEntryView 是回滚计划中单个节点的恢复进度。
@@ -363,14 +448,29 @@ type HealthView struct {
 	// Observing 表示当前波已达标、正在观察窗口内。
 	Observing bool `json:"observing"`
 
-	// 阈值计算：当前波已成功节点中的不健康节点数 vs 冻结的阈值。
+	// 阈值计算：当前波已成功、未隔离节点中的不健康节点数 vs 冻结的阈值。
 	UnhealthyNodes    int  `json:"unhealthy_nodes"`
 	MaxUnhealthy      int  `json:"max_unhealthy"`
 	ThresholdBreached bool `json:"threshold_breached"`
 
+	// 隔离闸门（创建时冻结）。零值表示未启用隔离。
+	QuarantineEnabled bool             `json:"quarantine_enabled"`
+	QuarantinePolicy  QuarantinePolicy `json:"quarantine_policy"`
+	QuarantinedNodes  int              `json:"quarantined_nodes"`
+	MaxQuarantined    int              `json:"max_quarantined"`
+	// 健康覆盖率 = 健康 / 已有健康结论的未隔离节点；窗口届满后分母即
+	// 全部未隔离已成功节点。Deciding 为当前已得出健康结论的节点数。
+	HealthyCoverage     float64 `json:"healthy_coverage"`
+	CoverageNumerator   int     `json:"coverage_numerator"`
+	CoverageDenominator int     `json:"coverage_denominator"`
+	MinHealthyCoverage  float64 `json:"min_healthy_coverage"`
+
 	SamplesRecorded int              `json:"samples_recorded"`
 	Nodes           []NodeHealthView `json:"nodes"`
 	Rollback        *RollbackView    `json:"rollback,omitempty"`
+
+	// Catchups 是本发布全部补跑计划的进度视图（按计划 ID 排序）。
+	Catchups []CatchupPlanView `json:"catchups,omitempty"`
 }
 
 // GetHealth 返回发布的健康视图；查询时顺带完成惰性评估（超时/观察窗口），
@@ -393,15 +493,21 @@ func (s *Service) GetHealth(releaseID string) (*HealthView, error) {
 }
 
 func healthViewOf(st *State, r *Release) *HealthView {
+	qp := r.Health.Quarantine
 	v := &HealthView{
-		ReleaseID:       r.ID,
-		State:           r.State,
-		Enabled:         r.HealthEnabled,
-		Policy:          r.Health,
-		CurrentWave:     r.CurrentWave,
-		ThresholdMetAt:  r.ThresholdMetAt,
-		SamplesRecorded: len(r.Samples),
-		MaxUnhealthy:    r.Health.MaxUnhealthy,
+		ReleaseID:          r.ID,
+		State:              r.State,
+		Enabled:            r.HealthEnabled,
+		Policy:             r.Health,
+		CurrentWave:        r.CurrentWave,
+		ThresholdMetAt:     r.ThresholdMetAt,
+		SamplesRecorded:    len(r.Samples),
+		MaxUnhealthy:       r.Health.MaxUnhealthy,
+		QuarantineEnabled:  qp != (QuarantinePolicy{}),
+		QuarantinePolicy:   qp,
+		QuarantinedNodes:   len(r.Quarantines),
+		MaxQuarantined:     qp.MaxNodes,
+		MinHealthyCoverage: qp.MinHealthyCoverage,
 	}
 	if r.HealthEnabled && !r.ThresholdMetAt.IsZero() {
 		v.WindowEndsAt = r.ThresholdMetAt.Add(r.Health.ObserveWindow)
@@ -420,9 +526,11 @@ func healthViewOf(st *State, r *Release) *HealthView {
 		}
 		return nodes[i] < nodes[j]
 	})
+	coverageHealthy, coverageDecided := 0, 0
 	for _, n := range nodes {
 		lease := r.Nodes[n]
 		total, bad := nodeSampleCounts(r, n)
+		quarantined := isQuarantinedLocked(r, n)
 		nv := NodeHealthView{
 			NodeID:           n,
 			Wave:             lease.Wave,
@@ -430,8 +538,11 @@ func healthViewOf(st *State, r *Release) *HealthView {
 			Samples:          total,
 			UnhealthySamples: bad,
 			PrevDigest:       lease.PrevDigest,
+			Quarantined:      quarantined,
 		}
 		switch {
+		case quarantined:
+			nv.Health = HealthQuarantined
 		case lease.Result != ResultSucceeded:
 			nv.Health = HealthUnknown
 		case bad > 0:
@@ -444,12 +555,39 @@ func healthViewOf(st *State, r *Release) *HealthView {
 		if ns := st.NodeStates[n]; ns != nil {
 			nv.CurrentDigest = ns.AppliedDigest
 		}
-		if lease.Wave == r.CurrentWave && lease.Result == ResultSucceeded && nv.Health == HealthUnhealthy {
+		if quarantined {
+			q := r.Quarantines[n]
+			nv.Quarantine = &QuarantineView{
+				Wave:             q.Wave,
+				Digest:           q.Digest,
+				Reason:           q.Reason,
+				At:               q.QuarantinedAt,
+				Samples:          q.Samples,
+				Unhealthy:        q.UnhealthySamples,
+				EvidenceEventIDs: append([]string(nil), q.EvidenceEventIDs...),
+			}
+		}
+		// 阈值/覆盖率只统计当前波已成功、未隔离且已有健康结论的节点。
+		inCurrentWave := lease.Wave == r.CurrentWave && lease.Result == ResultSucceeded && !quarantined
+		if inCurrentWave && nv.Health == HealthUnhealthy {
 			v.UnhealthyNodes++
+		}
+		if inCurrentWave && (nv.Health == HealthUnhealthy || nv.Health == HealthHealthy) {
+			coverageDecided++
+			if nv.Health == HealthHealthy {
+				coverageHealthy++
+			}
 		}
 		v.Nodes = append(v.Nodes, nv)
 	}
 	v.ThresholdBreached = r.HealthEnabled && v.UnhealthyNodes > r.Health.MaxUnhealthy
+	v.CoverageNumerator = coverageHealthy
+	v.CoverageDenominator = coverageDecided
+	if coverageDecided > 0 {
+		v.HealthyCoverage = float64(coverageHealthy) / float64(coverageDecided)
+	}
+
+	v.Catchups = catchupViewsOf(st, r)
 
 	if r.Rollback != nil {
 		restored, total := rollbackProgress(r.Rollback)

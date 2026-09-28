@@ -99,6 +99,15 @@ func (s *Service) CreateRelease(in CreateReleaseInput) (*Release, error) {
 			return nil, ErrInvalidPolicy
 		}
 	}
+	// 隔离闸门：零值关闭；启用要求 MaxNodes>=1、覆盖率在 (0,1]，
+	// 且必须与健康观察一并启用（隔离在观察期依据健康样本作出）。
+	quarantineEnabled := in.Health.Quarantine != (QuarantinePolicy{})
+	if quarantineEnabled {
+		if !healthEnabled || in.Health.Quarantine.MaxNodes < 1 ||
+			in.Health.Quarantine.MinHealthyCoverage <= 0 || in.Health.Quarantine.MinHealthyCoverage > 1 {
+			return nil, ErrInvalidPolicy
+		}
+	}
 
 	// 冻结：复制一份并校验全局唯一（保持调用方给定的顺序）。
 	targets := append([]string(nil), in.Targets...)
@@ -164,6 +173,23 @@ func (s *Service) CreateRelease(in CreateReleaseInput) (*Release, error) {
 		ev.ReleaseID, ev.Digest = r.ID, r.Digest
 		open := st.emit(EventWaveOpened, now)
 		open.ReleaseID, open.Wave = r.ID, 0
+
+		// 新发布取代旧发布：旧发布中任何目标节点仍在本次目标集合内的
+		// 未终态补跑计划立即作废，旧补跑不得继续执行。作废事件在新发布
+		// 创建事件之后写出，因果顺序清晰。
+		for _, old := range st.Releases {
+			if old.Seq == r.Seq {
+				continue
+			}
+			for _, p := range old.CatchupPlans {
+				if p.State == CatchupAborted || p.State == CatchupSucceeded {
+					continue
+				}
+				if _, targeted := seen[p.NodeID]; targeted {
+					abortCatchupLocked(st, old, p, CatchupAbortSuperseded, now)
+				}
+			}
+		}
 
 		out = cloneRelease(r)
 		return nil
@@ -414,6 +440,9 @@ func (s *Service) Cancel(releaseID string) error {
 		cancel := st.emit(EventReleaseCancelled, now)
 		cancel.ReleaseID = r.ID
 
+		// 取消使所有未终态的补跑计划作废：旧补跑不得在取消后继续执行。
+		abortActiveCatchupsLocked(st, r, CatchupAbortReleaseCancelled, now)
+
 		// 只对当前已成功的节点补偿；节点在本次发布中只出现一次，
 		// 且本迁移只发生一次，所以补偿通知每个成功节点恰好一条。
 		for w, wave := range r.Waves {
@@ -492,6 +521,10 @@ func (s *Service) GetConfigForNode(releaseID, nodeID string) (*Config, error) {
 		lease, ok := r.Nodes[nodeID]
 		if !ok {
 			return ErrNodeNotInRelease
+		}
+		// 已隔离节点不能再接收本次发布的新操作（含继续取配置）。
+		if isQuarantinedLocked(r, nodeID) {
+			return ErrConfigNotAvailable
 		}
 		if r.State != StateActive || lease.Wave != r.CurrentWave {
 			// 取消/完成后的任何未成功节点，以及未来波次、旧波次节点。
@@ -722,6 +755,22 @@ func cloneRelease(r *Release) *Release {
 			rb.Entries[k] = &ec
 		}
 		cp.Rollback = rb
+	}
+	if r.Quarantines != nil {
+		cp.Quarantines = make(map[string]*QuarantineRecord, len(r.Quarantines))
+		for k, q := range r.Quarantines {
+			qc := *q
+			qc.EvidenceEventIDs = append([]string(nil), q.EvidenceEventIDs...)
+			cp.Quarantines[k] = &qc
+		}
+	}
+	if r.CatchupPlans != nil {
+		cp.CatchupPlans = make(map[string]*CatchupPlan, len(r.CatchupPlans))
+		for k, pl := range r.CatchupPlans {
+			plc := *pl
+			plc.Path = append([]string(nil), pl.Path...)
+			cp.CatchupPlans[k] = &plc
+		}
 	}
 	return &cp
 }

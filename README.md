@@ -16,7 +16,12 @@
   - `ObserveWindow`：波次成功门槛达标后进入**观察期**，只有通过完整观察窗口才允许开启下一波（末波也需通过观察才能完成发布）。
   - `MinSamples`：观察期内每个已成功节点必须上报的最少健康样本数；窗口届满但样本不足时继续等待（不算超时）。
   - `MaxUnhealthy`：当前波已成功节点中允许的不健康节点数，**超过**即触发自动回滚（见下文）。
+  - `Quarantine`：隔离闸门（零值表示不允许隔离），与健康策略一并冻结：
+    - `MaxNodes`：本次发布允许隔离的最大节点数，超过即触发现有整体回滚。
+    - `MinHealthyCoverage` ∈ (0,1]：未隔离且已有健康结论的节点中，健康占比不得低于它，否则同样整体回滚。
 - **节点已应用版本（NodeState）**：跨发布维护单调的应用序号。新发布的成功回执才会推进它；旧发布的迟到回执不会覆盖节点较新的已应用版本。
+- **隔离（Quarantine）**：健康观察期操作员可依据一组健康样本把节点移出正常轨道。隔离决定绑定（发布、节点、配置摘要、隔离时波次、依据样本快照），落定即冻结。
+- **补跑（Catch-up）**：隔离节点修复后可创建补跑计划，从节点**当前配置**开始、按原发布波次顺序恢复到目标摘要；计划携带单调递增的 fencing token，并发领取/上报时状态只能向前。
 
 ## 状态机
 
@@ -83,10 +88,47 @@
 - 回滚完成后到达的**迟到成功回执不得覆盖回滚结果**：已有终态结果的节点回执被幂等忽略，不触碰节点已应用版本。
 - 回滚与取消互斥：`RollingBack` 中 `Cancel` 返回 `ErrRollbackInProgress`；已 `Cancelled` 的发布不会再做健康评估。
 
+## 隔离（Quarantine）语义
+
+健康观察期间，操作员通过 `QuarantineNode(QuarantineInput{ReleaseID, NodeID, EvidenceEventIDs, Reason})` 依据一组健康样本把节点标记为隔离。
+
+- **绑定与冻结**：隔离决定绑定（发布、节点、配置摘要、隔离时所在波次），并冻结依据样本事件号快照与当时的样本计数。决定只允许在发布 `Active`、节点属于当前波次且已成功时作出；重复隔离幂等返回（`QuarantineOutcome.AlreadyQuarantined = true`），**任何迟到输入都不改写已形成的决定**。
+- **依据校验**：必须携带至少一条依据（`ErrQuarantineNoEvidence`）；每条事件号都必须是已落库、且属于该（发布, 节点, 配置摘要）的样本，否则 `ErrQuarantineEvidenceMismatch`。
+- **隔离后的影响**：
+  - 该节点**不计入后续健康门槛**——不计入不健康节点数、不要求补齐 `MinSamples`、不计入健康覆盖率；
+  - 该节点**不能再接收本次发布的新操作**：`GetConfigForNode` 返回 `ErrConfigNotAvailable`；
+  - 健康样本迟到或重复到达时照常只追加到样本表（回滚/终态后按原规则拒绝），但**不会重新改写隔离决定或回滚决定**。
+- **隔离不能掩盖大面积故障**。创建发布时冻结 `MaxNodes` 与 `MinHealthyCoverage`，每次隔离决策后在同一事务内结算：
+  - 已隔离节点数 **超过** `MaxNodes`；或
+  - 未隔离且已有健康结论（样本达标或含失败样本）的节点中，健康覆盖率 **低于** `MinHealthyCoverage`；
+
+  任一成立即触发现有的整体回滚（`QuarantineOutcome.RollbackStarted = true`），被隔离节点同样进入回滚计划、恢复到各自发布前摘要。窗口届满时覆盖率分母即全部未隔离已成功节点。
+
+## 补跑（Catch-up）语义
+
+问题处理后，通过 `CreateCatchupPlan(releaseID, nodeID)` 为隔离节点创建补跑计划。
+
+- **从当前配置开始、按波次顺序恢复**：计划创建时冻结起点 `FromDigest`（节点当前实际配置）、目标 `TargetDigest`（原发布摘要）、节点原波次 `OriginalWave` 与有序路径 `Path`；节点已在目标上时路径退化为单元素。
+- **每个隔离节点至多一个未作废计划**：重复创建返回 `ErrCatchupExists`；仅未隔离节点返回 `ErrNodeNotQuarantined`。
+- **领取与 fencing**：`ClaimCatchup(planID, claimant)` 返回单调递增的 token 与计划快照；`ReportCatchup` / `GetCatchupConfig` 必须携带它。每次重新领取（失败后）换发新 token，**旧领取者的迟到成功以 `ErrCatchupFencing` 拒绝**，不能覆盖后来的状态。
+- **成功不写发布终态**：补跑成功只把节点已应用版本单调推进到目标摘要并写出 `catchup.succeeded`，**绝不重复写出** `release.completed` / `release.rolledback`。失败把任务退回 `failed`，可重新领取重试。
+- **无法继续的条件**（领取/成功上报时重新判定，命中即在同一事务作废计划并写出 `catchup.aborted`）：
+  - 整体发布已回滚（`release_rolled_back`）——回滚/取消在同一事务作废旧补跑；
+  - 发布已取消（`release_cancelled`）；
+  - 节点被更新的有效发布纳入目标（`superseded_by_new_release`）——新发布创建事务内立即作废；
+  - 节点基线漂移：当前配置既非计划起点也非目标（`node_baseline_changed`）。
+
+  已作废计划不可复活，旧上报/取配置一律 `ErrCatchupAborted`。
+
 ## 查询
 
 - `GetProgress(releaseID)`：波次进度（查询时顺带完成超时/健康惰性评估）。
-- `GetHealth(releaseID)`：健康视图，包含冻结的健康策略、观察窗口起止（`ThresholdMetAt` / `WindowEndsAt`）、阈值计算（`UnhealthyNodes` vs `MaxUnhealthy`、`ThresholdBreached`）、每个节点的健康证据（样本数/失败样本数/健康判定）与前后版本（`PrevDigest` / `CurrentDigest`）、回滚计划与进度（`Rollback.Restored / Total` 及逐节点恢复项）。
+- `GetHealth(releaseID)`：健康视图，包含冻结的健康策略、观察窗口起止（`ThresholdMetAt` / `WindowEndsAt`）、阈值计算（`UnhealthyNodes` vs `MaxUnhealthy`、`ThresholdBreached`）、每个节点的健康证据（样本数/失败样本数/健康判定）与前后版本（`PrevDigest` / `CurrentDigest`）、回滚计划与进度（`Rollback.Restored / Total` 及逐节点恢复项）。第三轮新增：
+  - **隔离闸门与覆盖率**：`QuarantineEnabled` / `QuarantinePolicy`、`QuarantinedNodes` / `MaxQuarantined`、`HealthyCoverage`（含 `CoverageNumerator / CoverageDenominator`）、`MinHealthyCoverage`；
+  - **隔离依据**：每个节点的 `Quarantined` 标记与 `Quarantine` 子视图（波次、摘要、原因、冻结的依据事件号 `EvidenceEventIDs`、隔离时样本计数）；
+  - **节点实际配置**：每个节点的 `CurrentDigest`（跨发布最新值）；
+  - **补跑进度**：`Catchups[]` 逐计划列出状态、起点/目标/路径、fencing、领取者、成功时间，以及 `NodeCurrentDigest` 与无法继续时的 `BlockedReason`。
+- `GetCatchupPlan(planID)`：单个补跑计划的最新快照（状态、进度、作废原因）。
 - `NodeAppliedVersion(nodeID)`：节点当前已应用版本（审计用）。
 
 ## 持久化与 outbox
@@ -121,6 +163,11 @@ svc.CreateRelease(configrollout.CreateReleaseInput{
         ObserveWindow: 5 * time.Minute,
         MinSamples:    2,
         MaxUnhealthy:  0,
+        // 隔离闸门：最多隔离 1 个节点，未隔离节点健康覆盖率不得低于 50%
+        Quarantine: configrollout.QuarantinePolicy{
+            MaxNodes:           1,
+            MinHealthyCoverage: 0.5,
+        },
     },
 })
 
@@ -147,6 +194,21 @@ health, _ := svc.GetHealth("rel-20260925-01") // 健康证据/阈值计算/前�
 
 // 7. 若触发了自动回滚：节点按 node.rollback 通知恢复后确认
 svc.ConfirmRollback("rel-20260925-01", "n1", prevDigest)
+
+// 7b. 健康观察期隔离异常节点（携带依据样本事件号）；闸门失守会触发整体回滚
+svc.QuarantineNode(configrollout.QuarantineInput{
+    ReleaseID:        "rel-20260925-01",
+    NodeID:           "n1",
+    EvidenceEventIDs: []string{"evt-0001"},
+})
+
+// 7c. 节点修复后创建补跑计划 -> 领取（拿 fencing token）-> 取配置 -> 上报
+plan, _ := svc.CreateCatchupPlan("rel-20260925-01", "n1")
+token, _, _ := svc.ClaimCatchup(plan.ID, "repair-worker-1")
+_, _ = svc.GetCatchupConfig(plan.ID, token)
+svc.ReportCatchup(configrollout.CatchupReport{
+    PlanID: plan.ID, NodeID: "n1", Token: token, Success: true, Digest: digest,
+})
 
 // 8. 周期驱动超时与健康评估（也可依赖回执/样本/查询时惰性触发）
 go func() {
@@ -177,6 +239,10 @@ svc.DispatchOutbox(ctx, func(ev configrollout.Event) error {
 | `ErrNodeNeverApplied` / `ErrEventNotFound` | 查询无结果 |
 | `ErrInvalidSample` / `ErrSampleConflict` / `ErrHealthNotEnabled` | 样本缺事件号或采样时间 / 同号异内容冲突 / 发布未启用健康策略 |
 | `ErrRollbackInProgress` / `ErrNoRollback` | 回滚中拒绝变更（暂停/恢复/取消/回执/样本）/ 发布无回滚计划 |
+| `ErrQuarantineNotEnabled` / `ErrNodeNotQuarantined` | 发布未配置隔离闸门 / 节点未隔离（重复隔离走幂等 outcome，不报错） |
+| `ErrQuarantineNoEvidence` / `ErrQuarantineEvidenceMismatch` | 隔离无依据样本 / 依据不属于该（发布, 节点, 摘要） |
+| `ErrCatchupNotFound` / `ErrCatchupExists` | 补跑计划不存在 / 隔离节点已有未作废计划 |
+| `ErrCatchupNotClaimable` / `ErrCatchupFencing` / `ErrCatchupAborted` | 计划当前不可领取（成功/运行中）/ 领取 token 过期（旧领取者迟到上报）/ 计划已作废（回滚、取消、被取代、基线漂移） |
 
 ## 测试
 
@@ -200,4 +266,16 @@ go test -race ./...
 - 回滚完成后迟到成功回执不覆盖回滚结果；回滚通知与终态通知重启后仍各只写出一次；
 - 健康查询视图：证据、阈值计算、每节点前后版本、回滚进度；
 - 基于 JSON 文件存储的进程重启恢复（进度、暂停、投递标记、回滚计划），重启后继续推进至完成；
-- outbox 顺序投递、sink 失败断点续投。
+- outbox 顺序投递、sink 失败断点续投；
+- 隔离策略冻结与非法值（必须随健康观察一并启用、`MaxNodes≥1`、覆盖率 ∈ (0,1]）；
+- 隔离决定绑定（发布/节点/摘要/波次）与依据冻结：重复隔离幂等、迟到样本（含失败样本）不改写决定、被隔离节点取不到配置；
+- 被隔离节点排除出门槛：不要求补齐样本、同伴健康且窗口届满即可推进/完成、覆盖率视图正确；
+- 隔离状态守卫（暂停中/非当前波/非成功节点拒绝）；
+- 隔离闸门：超 `MaxNodes` 或覆盖率低于 `MinHealthyCoverage` 时**同一事务**触发整体回滚，被隔离节点同样恢复到发布前摘要；
+- 回滚决定不被迟到样本改写（回滚中/终态拒绝样本与隔离操作）；
+- 补跑创建冻结：从节点当前配置开始、按原波次锚定、目标为发布摘要，重复创建/非隔离节点/终态后创建均被拒；
+- 补跑 fencing：未领取不上报、错误摘要/错误节点拒绝、成功不写发布终态通知、失败可重新领取换发新 token、旧领取者迟到成功被 `ErrCatchupFencing` 拒绝；
+- 补跑失效：回滚/取消同事务作废（含旧领取者迟到成功被拦），被更新发布接管时在创建事务内立即作废，基线漂移领取时作废并展示阻塞原因；
+- 补跑并发：多路领取/失败/成功并发后计划恰好成功一次、`catchup.succeeded` 恰好一条、版本单调；隔离/失败样本/取消并发下事件序列合法且回滚与取消互斥；
+- 隔离/回滚/补跑重启持久化：依据快照、计划状态、fencing 与事件唯一性在重开存储后保持；
+- 健康视图扩展：隔离标记与依据、覆盖率分子分母、节点实际配置、补跑进度与阻塞原因。
