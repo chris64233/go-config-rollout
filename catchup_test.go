@@ -797,3 +797,110 @@ func TestQuarantineBasisDedupAndPausedBreachView(t *testing.T) {
 		t.Fatalf("state=%s breached=%v", hv.State, hv.Quarantine.LimitBreached)
 	}
 }
+
+// 重建并发：旧领取者持有租约期间计划被重建（plan_replaced），其迟到成功
+// 不能写入新计划，也不能重复写出终态通知；新计划可正常领取跑完。
+func TestCatchupOldClaimRejectedAfterRebuild(t *testing.T) {
+	s, _, d, rel := setupSingleQuarantine(t)
+	mustCreateCatchup(t, s, rel)
+	oldLease := mustClaim(t, s, rel, "w-old", time.Hour)
+
+	// 旧计划仍活跃时重建：旧计划 aborted（plan_replaced），新计划 pending。
+	if _, _, err := s.RebuildCatchupPlan(rel); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	cv, _ := s.GetCatchup(rel)
+	if cv.State != CatchupPending {
+		t.Fatalf("new plan state = %s, want pending", cv.State)
+	}
+
+	// 旧领取者的迟到成功：新计划中的项尚未领取，回报被拒且不污染新计划。
+	if _, err := s.CompleteCatchup(CatchupResult{
+		ReleaseID: rel, NodeID: "a", Epoch: oldLease.Epoch, Digest: d, Success: true,
+	}); !errors.Is(err, ErrCatchupNotClaimed) {
+		t.Fatalf("old claim success after rebuild: %v", err)
+	}
+	cv, _ = s.GetCatchup(rel)
+	if cv.State != CatchupPending || cv.Entries[0].State != CatchupPending {
+		t.Fatalf("new plan corrupted by stale completion: %+v", cv)
+	}
+	evs, _ := s.PendingEvents()
+	if n := countEvents(evs, EventCatchupAborted); n != 1 {
+		t.Fatalf("catchup.aborted = %d, want 1", n)
+	}
+	if n := countEvents(evs, EventNodeCatchupSucceeded); n != 0 {
+		t.Fatalf("stale success wrote node.catchup_succeeded: %d", n)
+	}
+
+	// 新计划从 epoch 1 重新领取，正常跑完并只写一次终态通知。
+	newLease := mustClaim(t, s, rel, "w-new", time.Hour)
+	if newLease.Attempt != 2 || newLease.Epoch != 1 {
+		t.Fatalf("new lease = %+v, want attempt 2 epoch 1", newLease)
+	}
+	o := mustComplete(t, s, CatchupResult{
+		ReleaseID: rel, NodeID: "a", Epoch: newLease.Epoch, Digest: d, Success: true,
+	})
+	if o.State != CatchupDone {
+		t.Fatalf("outcome = %+v", o)
+	}
+	evs, _ = s.PendingEvents()
+	if n := countEvents(evs, EventCatchupCompleted); n != 1 {
+		t.Fatalf("catchup.completed = %d, want 1", n)
+	}
+}
+
+// 发布走到终态 RolledBack 后，持有租约的旧补跑领取者的迟到成功仍被拒绝，
+// 计划保持作废，节点版本不被覆盖，终态通知不被重复写出。
+func TestCatchupLateCompletionAfterRolledBackTerminal(t *testing.T) {
+	s, clk := newTestService(t)
+	d := mustRegister(t, s, "v1")
+	// MaxUnhealthy=0：隔离 a 后，b 的失败样本立即整体回滚。
+	hp := HealthPolicy{ObserveWindow: time.Hour, MinSamples: 1, MaxUnhealthy: 0}
+	qp := QuarantinePolicy{MaxQuarantined: 4, MinHealthyCoverage: 0.1}
+	mustCreateWithQuarantine(t, s, "rel", d, []string{"a", "b"}, 2, hp, qp)
+	mustAck(t, s, "rel", "a", d, true)
+	mustAck(t, s, "rel", "b", d, true)
+	mustReport(t, s, clk, "e-a", "rel", "a", d, true)
+	mustQuarantine(t, s, "rel", "a", []string{"e-a"})
+	mustCreateCatchup(t, s, "rel")
+	lease := mustClaim(t, s, "rel", "w", time.Hour)
+
+	// b 失败样本触发整体回滚（补跑同事务作废），随后两个节点确认恢复，
+	// 发布落到终态 RolledBack。
+	mustReport(t, s, clk, "e-bad", "rel", "b", d, false)
+	if _, err := s.ConfirmRollback("rel", "a", ""); err != nil {
+		t.Fatalf("confirm rollback a: %v", err)
+	}
+	if _, err := s.ConfirmRollback("rel", "b", ""); err != nil {
+		t.Fatalf("confirm rollback b: %v", err)
+	}
+	p, _ := s.GetProgress("rel")
+	if p.State != StateRolledBack {
+		t.Fatalf("state = %s, want rolled_back", p.State)
+	}
+
+	// 旧领取者迟到成功：计划已作废，拒绝；节点版本不被覆盖。
+	before, _ := s.NodeAppliedVersion("a")
+	if _, err := s.CompleteCatchup(CatchupResult{
+		ReleaseID: "rel", NodeID: "a", Epoch: lease.Epoch, Digest: d, Success: true,
+	}); !errors.Is(err, ErrCatchupNotActive) {
+		t.Fatalf("late success after rolled_back: %v", err)
+	}
+	after, _ := s.NodeAppliedVersion("a")
+	if after.AppliedSeq != before.AppliedSeq || after.AppliedDigest != before.AppliedDigest {
+		t.Fatalf("node version overwritten: before=%+v after=%+v", before, after)
+	}
+	if _, err := s.ClaimCatchup("rel", "w", time.Hour); !errors.Is(err, ErrCatchupNotActive) {
+		t.Fatalf("claim on rolled-back release: %v", err)
+	}
+	evs, _ := s.PendingEvents()
+	if n := countEvents(evs, EventCatchupAborted); n != 1 {
+		t.Fatalf("catchup.aborted = %d, want 1", n)
+	}
+	if n := countEvents(evs, EventCatchupCompleted); n != 0 {
+		t.Fatalf("catchup.completed = %d, want 0", n)
+	}
+	if n := countEvents(evs, EventReleaseRolledBack); n != 1 {
+		t.Fatalf("release.rolledback = %d, want 1", n)
+	}
+}
